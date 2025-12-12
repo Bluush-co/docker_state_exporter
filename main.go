@@ -13,8 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/moby/moby/api/types"
-	tcontainer "github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 	"github.com/go-kit/kit/log"
 	"github.com/prometheus/client_golang/prometheus"
@@ -29,7 +27,7 @@ const (
 type dockerHealthCollector struct {
 	mu                 sync.Mutex
 	containerClient    *client.Client
-	containerInfoCache []types.ContainerJSON
+	containerInfoCache []client.ContainerInspectResult
 	lastseen           time.Time
 }
 
@@ -87,16 +85,21 @@ func (c *dockerHealthCollector) Collect(ch chan<- prometheus.Metric) {
 func (c *dockerHealthCollector) collectMetrics(ch chan<- prometheus.Metric) {
 	for _, info := range c.containerInfoCache {
 		var labels = map[string]string{}
+		ctr := info.Container // The actual container data is in the Container field
 
 		rep := regexp.MustCompile("[^a-zA-Z0-9_]")
 
-		for k, v := range info.Config.Labels {
-			label := strings.ToLower("container_label_" + k)
-			labels[rep.ReplaceAllLiteralString(label, "_")] = v
+		if ctr.Config != nil {
+			for k, v := range ctr.Config.Labels {
+				label := strings.ToLower("container_label_" + k)
+				labels[rep.ReplaceAllLiteralString(label, "_")] = v
+			}
+			labels["image"] = ctr.Config.Image
+		} else {
+			labels["image"] = ""
 		}
-		labels["id"] = "/docker/" + info.ID
-		labels["image"] = info.Config.Image
-		labels["name"] = strings.TrimPrefix(info.Name, "/")
+		labels["id"] = "/docker/" + ctr.ID
+		labels["name"] = strings.TrimPrefix(ctr.Name, "/")
 
 		b2f := func(b bool) float64 {
 			if b {
@@ -112,44 +115,69 @@ func (c *dockerHealthCollector) collectMetrics(ch chan<- prometheus.Metric) {
 			return dst
 		}
 
+		// Health status
+		healthStatus := "none"
+		if ctr.State != nil && ctr.State.Health != nil {
+			healthStatus = string(ctr.State.Health.Status)
+		}
 		for _, lv := range []string{"none", "starting", "healthy", "unhealthy"} {
 			tmpLabels := mapcopy(labels)
 			tmpLabels["status"] = lv
-			ch <- prometheus.MustNewConstMetric(healthStatusDesc.Desc(tmpLabels), prometheus.GaugeValue, b2f(info.State.Health.Status == lv))
+			ch <- prometheus.MustNewConstMetric(healthStatusDesc.Desc(tmpLabels), prometheus.GaugeValue, b2f(healthStatus == lv))
+		}
+
+		// Container state
+		currentState := ""
+		if ctr.State != nil {
+			currentState = string(ctr.State.Status)
 		}
 		for _, lv := range []string{"paused", "restarting", "running", "removing", "dead", "created", "exited"} {
 			tmpLabels := mapcopy(labels)
 			tmpLabels["status"] = lv
-			ch <- prometheus.MustNewConstMetric(statusDesc.Desc(tmpLabels), prometheus.GaugeValue, b2f(info.State.Status == lv))
+			ch <- prometheus.MustNewConstMetric(statusDesc.Desc(tmpLabels), prometheus.GaugeValue, b2f(currentState == lv))
 		}
-		ch <- prometheus.MustNewConstMetric(oomkilledDesc.Desc(labels), prometheus.GaugeValue, b2f(info.State.OOMKilled))
-		startedat, err := time.Parse(time.RFC3339Nano, info.State.StartedAt)
-		errCheck(err)
-		finishedat, err := time.Parse(time.RFC3339Nano, info.State.FinishedAt)
-		errCheck(err)
-		ch <- prometheus.MustNewConstMetric(startedatDesc.Desc(labels), prometheus.GaugeValue, float64(startedat.Unix()))
-		ch <- prometheus.MustNewConstMetric(finishedatDesc.Desc(labels), prometheus.GaugeValue, float64(finishedat.Unix()))
-		ch <- prometheus.MustNewConstMetric(restartcountDesc.Desc(labels), prometheus.GaugeValue, float64(info.RestartCount))
+
+		// OOM killed
+		oomKilled := false
+		if ctr.State != nil {
+			oomKilled = ctr.State.OOMKilled
+		}
+		ch <- prometheus.MustNewConstMetric(oomkilledDesc.Desc(labels), prometheus.GaugeValue, b2f(oomKilled))
+
+		// Started at
+		startedAt := int64(0)
+		if ctr.State != nil && ctr.State.StartedAt != "" {
+			t, err := time.Parse(time.RFC3339Nano, ctr.State.StartedAt)
+			if err == nil {
+				startedAt = t.Unix()
+			}
+		}
+		ch <- prometheus.MustNewConstMetric(startedatDesc.Desc(labels), prometheus.GaugeValue, float64(startedAt))
+
+		// Finished at
+		finishedAt := int64(0)
+		if ctr.State != nil && ctr.State.FinishedAt != "" {
+			t, err := time.Parse(time.RFC3339Nano, ctr.State.FinishedAt)
+			if err == nil {
+				finishedAt = t.Unix()
+			}
+		}
+		ch <- prometheus.MustNewConstMetric(finishedatDesc.Desc(labels), prometheus.GaugeValue, float64(finishedAt))
+
+		// Restart count
+		ch <- prometheus.MustNewConstMetric(restartcountDesc.Desc(labels), prometheus.GaugeValue, float64(ctr.RestartCount))
 	}
 }
 
 func (c *dockerHealthCollector) collectContainer() {
-	containers, err := c.containerClient.ContainerList(context.Background(), types.ContainerListOptions{All: true})
+	result, err := c.containerClient.ContainerList(context.Background(), client.ContainerListOptions{All: true})
 	errCheck(err)
-	c.containerInfoCache = []types.ContainerJSON{}
+	c.containerInfoCache = []client.ContainerInspectResult{}
 
-	for _, container := range containers {
-		info, err := c.containerClient.ContainerInspect(context.Background(), container.ID)
+	for _, ctr := range result.Items {
+		info, err := c.containerClient.ContainerInspect(context.Background(), ctr.ID, client.ContainerInspectOptions{})
 		errCheck(err)
 		c.containerInfoCache = append(c.containerInfoCache, info)
-
-		if info.Config == nil {
-			info.Config = &tcontainer.Config{Labels: map[string]string{}}
-		}
-
-		if info.State.Health == nil {
-			info.State.Health = &types.Health{Status: "none"}
-		}
 	}
 }
 
@@ -190,15 +218,15 @@ func init() {
 func main() {
 	flag.Parse()
 
-	client, err := client.NewEnvClient()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	errCheck(err)
-	defer client.Close()
+	defer cli.Close()
 
-	_, err = client.Ping(context.Background())
+	_, err = cli.Ping(context.Background(), client.PingOptions{})
 	errCheck(err)
 
 	prometheus.MustRegister(&dockerHealthCollector{
-		containerClient: client,
+		containerClient: cli,
 	})
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
