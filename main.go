@@ -57,6 +57,9 @@ var (
 	finishedatDesc = descSource{
 		namespace + "finishedat",
 		"Time when the Container finished."}
+	exitcodeDesc = descSource{
+		namespace + "exitcode",
+		"Exit code of the Container's last run. Only emitted while the container is in the 'exited' or 'restarting' state; Docker resets State.ExitCode to 0 once a restarted container returns to 'running'."}
 	restartcountDesc = descSource{
 		"container_restartcount",
 		"Number of times the container has been restarted"}
@@ -68,6 +71,7 @@ func (c *dockerHealthCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- oomkilledDesc.Desc(nil)
 	ch <- startedatDesc.Desc(nil)
 	ch <- finishedatDesc.Desc(nil)
+	ch <- exitcodeDesc.Desc(nil)
 	ch <- restartcountDesc.Desc(nil)
 }
 
@@ -163,6 +167,15 @@ func (c *dockerHealthCollector) collectMetrics(ch chan<- prometheus.Metric) {
 			}
 		}
 		ch <- prometheus.MustNewConstMetric(finishedatDesc.Desc(labels), prometheus.GaugeValue, float64(finishedAt))
+
+		// Exit code — Docker resets State.ExitCode to 0 when a restarted container
+		// returns to 'running', so only emit while the container is currently exited
+		// or restarting (both states preserve the last non-zero exit code). Verified
+		// against Docker 29.4.0: --restart always containers show Exit=0 while
+		// running, Exit=<code> only during exited/restarting phases.
+		if ctr.State != nil && (currentState == "exited" || currentState == "restarting") {
+			ch <- prometheus.MustNewConstMetric(exitcodeDesc.Desc(labels), prometheus.GaugeValue, float64(ctr.State.ExitCode))
+		}
 
 		// Restart count
 		ch <- prometheus.MustNewConstMetric(restartcountDesc.Desc(labels), prometheus.GaugeValue, float64(ctr.RestartCount))
